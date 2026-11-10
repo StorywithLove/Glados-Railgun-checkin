@@ -854,6 +854,11 @@ class API:
             return "兑换未完成，请到站点确认"
 
         code, message = data.get("code", -2), data.get("message", "未知错误")
+        message = re.sub(
+            r"(?<![\w.])(\d+\.\d+)(?![\w.])",
+            lambda m: m.group(1).rstrip("0").rstrip("."),
+            str(message),
+        )
         if code == 0:
             self.log(LogEmoji.SUCCESS, f"{{ code : {code}, message : {message} }}")
             return f"兑换成功: {plan}"
