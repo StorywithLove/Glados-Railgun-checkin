@@ -64,6 +64,9 @@ const DEFAULT_SITES = [
   }
 ];
 
+// 签到页实测要 12–20 秒才可用，原来的 20 秒阈值正好卡在正常耗时尾部。
+const OPEN_TAB_TIMEOUT_MS = 45000;
+
 const MAX_AUTO_RETRIES = 3;
 const RETRY_BACKOFF_MS = [
   30 * 60 * 1000,   // 第 1 次自动重试：30 分钟
@@ -618,14 +621,34 @@ function classifyResult(data, fallbackText) {
  */
 let identityGuard = new Map();
 
+/**
+ * 等待标签页可用。
+ *
+ * 签到只依赖 DOM 可交互和 /api/ 请求，不需要等所有子资源加载完：
+ * `tab.status === 'complete'` 要求字体、统计脚本、图片全部到位，任何一个
+ * 慢请求都会把整次签到拖成「页面加载超时」。所以先看 tab 状态，loading
+ * 阶段再探一次 document.readyState，只要不是 loading 就放行。
+ */
 async function waitTabComplete(tabId, timeoutMs) {
   const deadline = Date.now() + (timeoutMs || 15000);
   while (Date.now() < deadline) {
     try {
       const tab = await chrome.tabs.get(tabId);
-      if (tab && tab.status === 'complete') return true;
+      if (!tab) return false;
+      // 导航尚未提交时标签页还是 about:blank，它的 readyState 天生是 complete，
+      // 直接采信会在空白页上下判断，必须先看到真实页面。
+      const onRealPage = typeof tab.url === 'string' && /^https?:/i.test(tab.url);
+      if (onRealPage && tab.status === 'complete') return true;
+      if (onRealPage && tab.status === 'loading') {
+        const probe = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => document.readyState,
+        }).catch(() => null);
+        const state = probe && probe[0] && probe[0].result;
+        if (state && state !== 'loading') return true;
+      }
     } catch (e) {
-      return false; // tab 已被关闭
+      return false; // tab 已被关闭 / 尚未提交导航
     }
     await sleep(400);
   }
@@ -740,18 +763,29 @@ async function verifyIdentity(tabId, account, result, mode) {
  * @returns {{tabId:number|null, ruleId:number|null, ok:boolean}}
  */
 async function openSessionTab(account, site, path) {
-  const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
-  const tabId = tab.id;
-  let ruleId = null;
+  const attempt = async () => {
+    const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
+    const tabId = tab.id;
+    let ruleId = null;
 
-  // 必须先在导航前挂规则，否则首个请求就不会带上目标账号身份
-  if (authModeOf(account) === 'cookie') {
-    ruleId = await addTabScopedRule(tabId, account, site);
-  }
+    // 必须先在导航前挂规则，否则首个请求就不会带上目标账号身份
+    if (authModeOf(account) === 'cookie') {
+      ruleId = await addTabScopedRule(tabId, account, site);
+    }
 
-  await chrome.tabs.update(tabId, { url: `https://${site.domain}${path}` });
-  const ok = await waitTabComplete(tabId, 20000);
-  return { tabId, ruleId, ok };
+    await chrome.tabs.update(tabId, { url: `https://${site.domain}${path}` });
+    const ok = await waitTabComplete(tabId, OPEN_TAB_TIMEOUT_MS);
+    return { tabId, ruleId, ok };
+  };
+
+  const opened = await attempt();
+  if (opened.ok) return opened;
+
+  // 一次本地重试：关闭标签页、稍等再开。
+  // 单次网络抖动不应该直接把账号推进 30 分钟的退避。
+  await closeSessionTab(opened.tabId, opened.ruleId);
+  await sleep(2000);
+  return attempt();
 }
 
 async function closeSessionTab(tabId, ruleId) {
@@ -1215,7 +1249,7 @@ async function probeBrowserLogin(domain) {
     const tab = await chrome.tabs.create({ url: 'about:blank', active: false });
     tabId = tab.id;
     await chrome.tabs.update(tabId, { url: `https://${domain}/console/checkin` });
-    const ok = await waitTabComplete(tabId, 20000);
+    const ok = await waitTabComplete(tabId, OPEN_TAB_TIMEOUT_MS);
     if (!ok) return { reachable: false, reason: '页面加载超时' };
 
     await sleep(800);
